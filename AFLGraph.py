@@ -1,4 +1,4 @@
-'''
+"""
     This file is part of AFL-Cast.
 
     AFL-Cast is free software: you can redistribute it and/or modify it under the terms of the 
@@ -12,13 +12,15 @@
     You should have received a copy of the GNU General Public License along with AFL-Cast. 
     If not, see <https://www.gnu.org/licenses/>. 
 
-'''
+"""
 
 from miasm.analysis.binary import Container
 from miasm.analysis.machine import Machine
 from miasm.core.locationdb import LocationDB
 from miasm.core.asmblock import AsmConstraint
+from miasm.expression.expression import ExprId
 import miasm
+import lief
 
 
 def attr2str(default_attr, attr):
@@ -28,12 +30,24 @@ def attr2str(default_attr, attr):
     )
 
 
+def get_afl_maybe_log(binary):
+    # get all afl_maybe_log functions
+    elf = lief.parse(binary)
+    symbols = elf.symbols
+    afl_maybe_logs = []
+    for sym in symbols:
+        if sym.name == "__afl_maybe_log":
+            afl_maybe_logs.append(sym.value)
+    return afl_maybe_logs
+
+
 class AFLBlock:
     def __init__(self, address):
         self.address = address
         self.block_id = 0
         self.successors = []
         self.hit = False
+        self.visited = False
 
     def __str__(self):
         return "AFLBlock(0x%.8x, 0x%.4x, [%.4d], %s)" % (
@@ -52,6 +66,18 @@ class AFL:
         self.loc_db = LocationDB()
 
         self.cont = Container.from_stream(open(self.binary, "rb"), self.loc_db)
+        self.afl_maybe_logs = get_afl_maybe_log(self.binary)
+        if len(self.afl_maybe_logs) == 0:
+            print("[-] The Input binary does not have AFL Instrumentation. Exiting.")
+            exit(-1)
+        # add __afl_maybe_log name to location
+        temp = 0
+        for addr in self.afl_maybe_logs:
+            loc_key = self.loc_db.get_or_create_offset_location(addr)
+            self.loc_db.add_location_name(loc_key, "__afl_maybe_log_%d" % temp)
+            dont_dis.append("__afl_maybe_log_%d" % temp)
+            temp += 1
+
         self.machine = Machine(self.cont.arch)
         self.aflgraph = None
 
@@ -83,6 +109,10 @@ class AFL:
     def get_block(self, offset):
         loc_key = self.cont.loc_db.get_offset_location(offset)
         block = self.asmcfg.loc_key_to_block(loc_key)
+        if block is None:
+            block = list(self.get_dis_cfg(offset).blocks)[0]
+            self.asmcfg.add_block(block)
+            self.asmcfg.rebuild_edges()
         return block
 
     def get_dis_cfg(self, offset):
@@ -118,11 +148,13 @@ class AFL:
 
     def get_afl_blockid(self, block):
         offset = self.cont.loc_db.get_location_offset(block)
-        aflmaybelog = self.cont.loc_db.get_name_location("__afl_maybe_log")
         lines = self.get_block(offset).lines
         for i in range(len(lines)):
             if lines[i].name == "PUSH" and lines[i].args[0].is_loc():
-                if lines[i].args[0].loc_key == aflmaybelog:
+                offset = self.loc_db.get_location_offset(lines[i].args[0].loc_key)
+                if offset in self.afl_maybe_logs:
+                    if isinstance(lines[i - 1].args[1], ExprId):
+                        __import__("pdb").set_trace()
                     return int(lines[i - 1].args[1])
         return False
 
@@ -149,10 +181,19 @@ class AFLGraph:
     def is_valid_destination(self, loc_key):
         curr_block = self.asmcfg.loc_key_to_block(loc_key)
         if curr_block is None:
-            curr_block = list(self.context.get_dis_cfg(self.context.loc_db.get_location_offset(loc_key)).blocks)[0]
+            curr_block = list(
+                self.context.get_dis_cfg(
+                    self.context.loc_db.get_location_offset(loc_key)
+                ).blocks
+            )[0]
             self.asmcfg.add_block(curr_block)
             self.asmcfg.rebuild_edges()
-        if len(curr_block.lines) < 3 and curr_block.lines[-1].name == "JMP" and curr_block.lines[-1].getdstflow(self.context.loc_db)[0].is_loc() is False:
+        if (
+            len(curr_block.lines) < 3
+            and curr_block.lines[-1].name == "JMP"
+            and curr_block.lines[-1].getdstflow(self.context.loc_db)[0].is_loc()
+            is False
+        ):
             return False
         return True
 
@@ -166,6 +207,34 @@ class AFLGraph:
 
         afl_blocks = []
         successors = self.asmcfg.successors(curr_block.loc_key)
+
+        # special case: where we will only have 1 call to __afl_maybe_log
+        # and that too inside the function which is being called. We detect this case
+        # by checking if the number of successors of curr_block is 2. If it is 2, then
+        # we check the next block after curr_block as afl_id or not. If it does not have
+        # afl_id then we return only the afl_id in the call destination.
+        # example:
+        # curr_block:
+        #     mov     r12, rax
+        #     xor     eax, eax
+        #     call    init          # we will have one afl_maybe_log inside this function)
+        # next_block:
+        #     mov     rsi, [argv+8] # since, we do not have afl id in the next block
+        #     mov     rbp, rax      # we only return the afl id from above function ("init")
+        #     mov     rdi, bin
+        #     call    load_file
+
+        if len(successors) == 2:
+            next_block = curr_block.get_next()
+            next_block_aflid = self.context.get_afl_blockid(next_block)
+            if next_block_aflid is False:
+                successors.remove(next_block)
+                successor_aflid = self.context.get_afl_blockid(successors[0])
+                if successor_aflid is not False:
+                    return [successors[0]]
+                else:
+                    return None
+
         for succ in successors:
             succ_block = self.asmcfg.loc_key_to_block(succ)
             res = self.get_next_afl_blocks(succ_block)
@@ -188,12 +257,20 @@ class AFLGraph:
                 # get return address block
                 return_block = self.asmcfg.loc_key_to_block(return_block_loc)
                 if return_block is None:
-                    return_block = list(self.context.get_dis_cfg(self.context.loc_db.get_location_offset(return_block_loc)).blocks)[0]
+                    return_block = list(
+                        self.context.get_dis_cfg(
+                            self.context.loc_db.get_location_offset(return_block_loc)
+                        ).blocks
+                    )[0]
                     self.asmcfg.add_block(return_block)
                     self.asmcfg.rebuild_edges()
                 # get the blocks which has afl id and occur
                 # right after the return block
                 afl_blocks_after_return_block = self.get_next_afl_blocks(return_block)
+
+                if afl_blocks_after_return_block is None:
+                    return None
+
                 for leaf in leaves:
 
                     # for each leaf that has afl id
@@ -211,7 +288,7 @@ class AFLGraph:
         for i in range(len(curr_block.lines)):
             if curr_block.lines[::-1][i].name == "LEA":
                 instr = curr_block.lines[::-1][i]
-                nextr = curr_block.lines[::-1][i-1]
+                nextr = curr_block.lines[::-1][i - 1]
                 break
         if instr.name == "LEA":
             jmptbl = instr.args[1]
@@ -227,12 +304,13 @@ class AFLGraph:
             file.close()
 
         jmptbl_l = []
-        temp = 0xffffffff
+        temp = 0xFFFFFFFF
 
         import struct
+
         i = 0
-        while (temp & 0xff000000) == (0xff << 24):
-            temp = struct.unpack("<I", data[jmptbl + i*4: jmptbl + (i+1) * 4])[0]
+        while (temp & 0xFF000000) == (0xFF << 24):
+            temp = struct.unpack("<I", data[jmptbl + i * 4 : jmptbl + (i + 1) * 4])[0]
             jmptbl_l.append(temp)
             i += 1
 
@@ -247,24 +325,25 @@ class AFLGraph:
             switch_candidate = target_block
             self.asmcfg.merge(target_asmcfg)
             # self.asmcfg.add_block(target_block)
-            self.asmcfg.add_edge(curr_block.loc_key, target_block.loc_key, AsmConstraint.c_to)
+            self.asmcfg.add_edge(
+                curr_block.loc_key, target_block.loc_key, AsmConstraint.c_to
+            )
 
             # not all switch blocks end with "JMP" (0x166a)
-#             while target_block.lines[-1].name != "JMP":
-#                 if target_block.lines[-1].name in ["CALL"]:
-#                     self.handle_calls(target_block)
-# 
-#                 next_block_loc_key = target_block.get_next()
-#                 next_block = target_asmcfg.loc_key_to_block(next_block_loc_key)
-#                 self.asmcfg.add_block(next_block)
-#                 self.asmcfg.add_edge(target_block.loc_key, next_block_loc_key, AsmConstraint.c_next)
-#                 target_block = next_block
-# 
-#             curr_block = target_block
-#             parent = self.get_block_by_addr(switch_candidate.get_offsets()[0])
-#             curr = self.get_block_by_addr(curr_block.get_offsets()[0])
-#             self.build_graph(curr_block, parent, curr)
-
+        #             while target_block.lines[-1].name != "JMP":
+        #                 if target_block.lines[-1].name in ["CALL"]:
+        #                     self.handle_calls(target_block)
+        #
+        #                 next_block_loc_key = target_block.get_next()
+        #                 next_block = target_asmcfg.loc_key_to_block(next_block_loc_key)
+        #                 self.asmcfg.add_block(next_block)
+        #                 self.asmcfg.add_edge(target_block.loc_key, next_block_loc_key, AsmConstraint.c_next)
+        #                 target_block = next_block
+        #
+        #             curr_block = target_block
+        #             parent = self.get_block_by_addr(switch_candidate.get_offsets()[0])
+        #             curr = self.get_block_by_addr(curr_block.get_offsets()[0])
+        #             self.build_graph(curr_block, parent, curr)
 
         self.asmcfg.rebuild_edges()
         switch_dispatch_block = curr_block
@@ -275,9 +354,10 @@ class AFLGraph:
             curr = self.get_block_by_addr(curr_block.get_offsets()[0])
             self.build_graph(curr_block, parent, curr)
 
-
     def build_graph(self, curr_block, parent, curr):
         """Builds the graph of all AFL instrumented Basic Blocks"""
+        # curr_block is now visited
+        curr.visited = True
 
         # if it has successors but it does not have afl id
         afl_blockid = self.context.get_afl_blockid(curr_block.loc_key)
@@ -313,6 +393,8 @@ class AFLGraph:
                     parent.successors.append(self.cache[succ_offset])
                     continue
 
+                if curr.visited:
+                    continue
                 # if its a call instruction we must also process the
                 # return edges
                 if curr_block.lines[-1].name in ["CALL"]:
@@ -320,6 +402,9 @@ class AFLGraph:
 
                 # traverse
                 curr_block = succ_block
+                # print("==========361===========")
+                # print(curr_block)
+                # print("==========361===========")
                 self.build_graph(curr_block, parent, curr)
 
         # if it has successors and it has afl id
@@ -339,10 +424,16 @@ class AFLGraph:
                     parent.successors.append(self.cache[succ_offset])
                     continue
 
+                if curr.visited:
+                    continue
+
                 if curr_block.lines[-1].name in ["CALL"]:
                     self.handle_calls(curr_block)
 
                 curr_block = succ_block
+                # print("==========387===========")
+                # print(curr_block)
+                # print("==========387===========")
                 self.build_graph(curr_block, parent, curr)
 
     def process_pending_edges(self):

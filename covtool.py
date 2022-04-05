@@ -1,4 +1,4 @@
-'''
+"""
     This file is part of AFL-Cast.
 
     AFL-Cast is free software: you can redistribute it and/or modify it under the terms of the 
@@ -12,7 +12,7 @@
     You should have received a copy of the GNU General Public License along with AFL-Cast. 
     If not, see <https://www.gnu.org/licenses/>. 
 
-'''
+"""
 
 from optparse import OptionParser
 from AFLGraph import AFL
@@ -93,9 +93,10 @@ def main():
             f"[+] Converted coverage output file will be present at {options.outputfile}"
         )
 
-    afl = AFL(
-        options.input, options.bitmap, options.function, True, ["__afl_maybe_log"]
-    )
+    afl = AFL(options.input, options.bitmap, options.function, True)
+    if afl is None:
+        logging.error("[-] No AFL Instrumentation found.")
+        exit(-1)
     graph = afl.get_afl_graph()
     graph.get_hits()
     graph.get_dot(options.graph)
